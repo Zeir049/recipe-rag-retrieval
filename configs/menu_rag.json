@@ -1,0 +1,158 @@
+{
+  "data": {
+    "emb_path": "recipe_embeddings_e5_large.npy",
+    "meta_path": "recipe_meta.csv",
+    "meta_encoding": "utf-8-sig"
+  },
+  "fields": {
+    "title": "CKG_NM",
+    "doc_id": "RCP_SNO",
+    "ingredients": "ingredients_keywords",
+    "kind": "kind",
+    "method": "method",
+    "situation": "situation"
+  },
+  "passage": {
+    "key_ingredients_max": 10,
+    "template": "[MENU] {title}\n- 종류={kind} | 조리={method} | 상황={situation}\n- 핵심 재료: {ingredients_compact}\n- 근거 ID: {doc_id}\n"
+  },
+  "selection": {
+    "pool_multiplier": 10,
+    "dedupe_field": "title",
+    "min_score_default": 0.0
+  },
+  "auto_filters": [
+    { "trigger_contains": ["샐러드"], "field": "kind", "value": "샐러드" },
+    { "trigger_contains": ["다이어트", "저칼로리", "저열량"], "field": "situation", "value": "다이어트" }
+  ],
+  "diversity": {
+    "field": "method",
+    "max_per_value_default": 1
+  },
+  "output": {
+    "key_ingredients_topn": 5,
+    "include_method_choice_line": true,
+    "show_filters_in_header": true,
+    "show_tags": true
+  },
+  "diversity_tags": {
+    "enabled": false,
+    "max_per_tag_default": 2
+},
+
+  "rules": {
+    "reasons": [
+      {
+        "name": "tofu_protein",
+        "priority": 100,
+        "when": {
+          "any": [
+            { "field": "title", "contains_any": ["두부", "두부면"] },
+            { "field": "key_ingredients", "contains_any": ["두부", "두부면"] }
+          ]
+        },
+        "text": "두부 기반이라 단백질을 챙기면서 가볍게 구성하기 좋아요."
+      },
+      {
+        "name": "shrimp_protein",
+        "priority": 90,
+        "when": {
+          "any": [
+            { "field": "title", "contains_any": ["새우"] },
+            { "field": "key_ingredients", "contains_any": ["새우"] }
+          ]
+        },
+        "text": "새우 같은 해산물 단백질을 더해 포만감은 챙기고 부담은 줄이기 좋아요."
+      },
+      {
+        "name": "fruit_fresh",
+        "priority": 80,
+        "when": {
+          "any": [
+            { "field": "title", "contains_any": ["과일"] },
+            { "field": "key_ingredients", "contains_any": ["딸기", "사과", "귤", "레몬", "바나나"] }
+          ]
+        },
+        "text": "과일+채소 조합이라 상큼하게 먹기 좋고, 포만감도 보완하기 좋아요."
+      },
+      {
+        "name": "seaweed_light",
+        "priority": 70,
+        "when": {
+          "any": [
+            { "field": "title", "contains_any": ["해초"] },
+            { "field": "key_ingredients", "contains_any": ["해초"] }
+          ]
+        },
+        "text": "해초 계열이라 담백하고 포만감 대비 부담이 적은 편이에요."
+      },
+      {
+        "name": "veggie_light",
+        "priority": 60,
+        "when": {
+          "any": [
+            { "field": "key_ingredients", "contains_any": ["토마토", "양상추", "상추", "치커리", "오이", "당근"] }
+          ]
+        },
+        "text": "채소 중심(토마토/상추류)이라 가볍게 한 그릇 구성하기 좋아요."
+      },
+      {
+        "name": "pasta_filling",
+        "priority": 50,
+        "when": {
+          "any": [
+            { "field": "title", "contains_any": ["파스타"] },
+            { "field": "key_ingredients", "contains_any": ["파스타", "면", "빵"] }
+          ]
+        },
+        "text": "면/탄수 요소가 있어 한 끼로 든든하게 먹고 싶을 때 선택지로 좋아요(양 조절 추천)."
+      }
+    ],
+    "tags": [
+    {
+      "name": "단백질",
+      "when": {
+        "any": [
+          { "field": "title", "contains_any": ["두부", "두부면", "닭", "계란", "새우", "참치", "소고기", "돼지고기"] },
+          { "field": "key_ingredients", "contains_any": ["두부", "두부면", "닭", "계란", "새우", "참치", "소고기", "돼지고기"] }
+        ]
+      }
+    },
+    {
+      "name": "과일/상큼",
+      "when": { "any": [ { "field": "key_ingredients", "contains_any": ["딸기", "사과", "귤", "레몬", "오렌지", "바나나"] } ] }
+    },
+    {
+      "name": "해산물/해초",
+      "when": {
+        "any": [
+          { "field": "title", "contains_any": ["해초", "새우", "오징어", "문어", "조개"] },
+          { "field": "key_ingredients", "contains_any": ["해초", "새우", "오징어", "문어", "조개"] }
+        ]
+      }
+    },
+    {
+      "name": "채소위주",
+      "when": { "any": [ { "field": "key_ingredients", "contains_any": ["토마토", "양상추", "상추", "치커리", "오이", "당근"] } ] }
+    },
+    {
+      "name": "탄수/든든",
+      "when": {
+        "any": [
+          { "field": "title", "contains_any": ["파스타", "면", "국수", "밥", "떡"] },
+          { "field": "key_ingredients", "contains_any": ["파스타", "면", "국수", "밥", "떡", "빵"] }
+        ]
+      }
+    },
+    {
+      "name": "매콤",
+      "when": {
+        "any": [
+          { "field": "title", "contains_any": ["매운", "매콤"] },
+          { "field": "key_ingredients", "contains_any": ["고추장", "고춧가루", "청양고추", "고추"] }
+        ]
+      }
+    }
+  ]
+}
+}

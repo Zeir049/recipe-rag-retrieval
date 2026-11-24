@@ -1,0 +1,9 @@
+# Tested with Python 3.12 on CPU: numpy 2.4.0, pandas 2.3.3,
+# sentence-transformers 5.2.0, torch 2.9.1.
+numpy>=1.24
+pandas>=2.0
+sentence-transformers>=2.2
+torch>=2.0
+# optional: YAML configs (core/io.py) and the embedding notebook
+# pyyaml
+# jupyter

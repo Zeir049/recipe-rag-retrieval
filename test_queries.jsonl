@@ -1,0 +1,33 @@
+# 기본: 다이어트/샐러드
+{"q":"다이어트 저칼로리 샐러드","k":7,"min_score":0.82,"diversify_method":true,"max_per_method":1,"generate_rule":true}
+{"q":"단백질 많은 다이어트 샐러드","k":7,"min_score":0.82,"diversify_method":true,"max_per_method":1,"generate_rule":true}
+{"q":"상큼한 과일 샐러드 다이어트","k":7,"min_score":0.82,"diversify_method":true,"max_per_method":1,"generate_rule":true}
+{"q":"해산물 샐러드 다이어트","k":7,"min_score":0.82,"diversify_method":true,"max_per_method":1,"generate_rule":true}
+
+# 매콤/닭
+{"q":"매콤한 닭요리 추천","k":5,"min_score":0.82,"diversify_method":false,"generate_rule":true}
+{"q":"매운 국물 닭요리","k":5,"min_score":0.82,"diversify_method":false,"generate_rule":true}
+{"q":"매운 찜닭 느낌","k":5,"min_score":0.82,"diversify_method":false,"generate_rule":true}
+
+# 간단/시간
+{"q":"10분 안에 만들 수 있는 간단한 아침 메뉴","k":7,"min_score":0.80,"diversify_method":true,"max_per_method":1,"generate_rule":true}
+{"q":"혼밥 간단 메뉴","k":7,"min_score":0.80,"diversify_method":true,"max_per_method":1,"generate_rule":true}
+
+# 국/탕/해장
+{"q":"해장에 좋은 국물 요리","k":7,"min_score":0.80,"diversify_method":true,"max_per_method":1,"generate_rule":true}
+{"q":"따뜻한 국/탕 추천","k":7,"min_score":0.80,"diversify_method":true,"max_per_method":1,"generate_rule":true}
+
+# 채식/두부
+{"q":"고기 없이도 든든한 메뉴","k":7,"min_score":0.80,"diversify_method":true,"max_per_method":1,"generate_rule":true}
+{"q":"두부 활용 메뉴 추천","k":7,"min_score":0.80,"diversify_method":true,"max_per_method":1,"generate_rule":true}
+
+# 아이/가족
+{"q":"아이도 먹기 좋은 자극적이지 않은 메뉴","k":7,"min_score":0.80,"diversify_method":true,"max_per_method":1,"generate_rule":true}
+{"q":"가족 저녁 메뉴 추천","k":7,"min_score":0.80,"diversify_method":true,"max_per_method":1,"generate_rule":true}
+
+# 손님/파티
+{"q":"손님접대 메인 요리 추천","k":7,"min_score":0.80,"diversify_method":true,"max_per_method":1,"generate_rule":true}
+
+# 야식/술안주
+{"q":"술안주로 좋은 메뉴","k":7,"min_score":0.80,"diversify_method":true,"max_per_method":1,"generate_rule":true}
+{"q":"야식으로 부담 덜한 메뉴","k":7,"min_score":0.80,"diversify_method":true,"max_per_method":1,"generate_rule":true}
