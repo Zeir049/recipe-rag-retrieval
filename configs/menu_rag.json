@@ -2,7 +2,8 @@
   "data": {
     "emb_path": "recipe_embeddings_e5_large.npy",
     "meta_path": "recipe_meta.csv",
-    "meta_encoding": "utf-8-sig"
+    "meta_encoding": "utf-8-sig",
+    "embed_model": "intfloat/multilingual-e5-large"
   },
   "fields": {
     "title": "CKG_NM",

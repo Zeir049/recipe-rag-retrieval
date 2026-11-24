@@ -1,0 +1,9 @@
+{
+  "run_file": "runs\\run_20261124_182545.jsonl",
+  "queries_file": "test_queries.jsonl",
+  "count": 18,
+  "avg_returned": 6.666666666666667,
+  "avg_avg_score": 0.8508350044961959,
+  "fail_count": 0,
+  "filtered_queries": 4
+}

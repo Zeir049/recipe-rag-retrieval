@@ -2,18 +2,13 @@
 
 Retrieval stage for a recipe RAG (retrieval-augmented generation) system, built as a personal project.
 Given a Korean natural-language request (e.g. "다이어트 저칼로리 샐러드"), it embeds the query with
-`intfloat/multilingual-e5-large`, ranks about 5,000 Korean recipes by cosine similarity, picks a
-small, varied set of candidates and formats each one as a short passage that ends with the
-recipe ID it came from (`근거 ID`, "evidence ID").
+`intfloat/multilingual-e5-large`, ranks about 5,000 Korean recipes by cosine similarity, applies
+filters triggered by words in the query, picks a set of candidates with varied cooking methods, adds
+a rule-based reason to each, and formats each one as a short passage that ends with the recipe ID it
+came from (`근거 ID`, "evidence ID").
 
 **There is no generation step yet.** The output is the evidence a language model would be given;
 no LLM is called anywhere in this repository.
-
-> **Status.** The code was refactored on 2026-01-13 and that refactor is unfinished.
-> The batch-evaluation results below were produced on 2026-01-12 by the earlier version.
-> In the current code, dense retrieval, cosine top-k, cooking-method diversity and the evidence-ID
-> output work, but the query-triggered filters and the rule-based reasons/tags described in the
-> config are **not wired into the current entry points** (see [Known issues](#known-issues)).
 
 ## Pipeline
 
@@ -24,7 +19,7 @@ recipes_rag_with_metadata.jsonl ──build_from_jsonl.py──► recipes_outpu
                                                               ▼  multilingual-e5-large, L2-normalised
                                    recipe_embeddings_e5_large.npy (5000 × 1024)  +  recipe_meta.csv
                                                               │
-query ──"query: " prefix──► e5 embedding ──► cosine top-k ──► filters / method diversity ──► rule-based reasons & tags
+query ──"query: " prefix──► e5 embedding ──► cosine top-(10·k) ──► filters / dedupe / method diversity ──► rule-based reasons & tags
                                                               │
                                                               ▼
                                      evidence-tagged passages  ──►  (next step: LLM generator)
@@ -36,46 +31,48 @@ query ──"query: " prefix──► e5 embedding ──► cosine top-k ──
 2. **Document embeddings** – `embedding.ipynb` encodes `"passage: " + doc_text` with
    `intfloat/multilingual-e5-large` (normalised, batch size 64, GPU) and saves
    `recipe_embeddings_e5_large.npy` (5000 × 1024, float32) and `recipe_meta.csv`.
-3. **Query embedding and cosine top-k** – the query is embedded with the same model and scored
-   against the L2-normalised document matrix (`core/retrieval.py`, `core/engine.py`,
-   `local_retrieval.py`). The engine takes a pool of 5·k candidates and drops those below `min_score`.
-4. **Query-triggered filters** – `configs/menu_rag.json → auto_filters` maps trigger words to
-   metadata constraints, e.g. a query containing "샐러드" keeps `kind = 샐러드`, and "다이어트 / 저칼로리 /
-   저열량" keeps `situation = 다이어트`. The filter is relaxed if it leaves fewer than k candidates.
-   *(Used in the 2026-01-12 runs; not connected in the current code.)*
-5. **Cooking-method diversity** – at most `max_per_method` results per cooking method (`method`
-   column, e.g. 비빔, 데치기, 찜); if that leaves fewer than k results, the rest are filled by score.
-6. **Rule-based explanations and tags** – `core/rule_engine.py` evaluates the `rules.reasons` and
-   `rules.tags` blocks of the config (`contains_any` / `equals` / `regex` conditions combined with
-   `any` / `all`) against the title and key ingredients; the highest-priority matching reason
-   becomes the "추천 이유" (reason) line, followed by a note on the item's cooking method.
-   *(Used in the 2026-01-12 runs; the evaluator is here but not called by the current engine.)*
-7. **Evidence-tagged passages** – each result is rendered with the template in
-   `configs/menu_rag.json → passage.template`:
+3. **Query embedding and cosine top-k** – the query is embedded as `"query: " + query` with the
+   same model (loaded once per process) and scored against the L2-normalised document matrix
+   (`core/retrieval.py`). The engine keeps a pool of `pool_multiplier · k` = 10·k candidates.
+4. **Ingredients and tags** – `core/enrich.py` strips quantities and units from the ingredient
+   string and keeps the first 5 as key ingredients; `core/rule_engine.py` assigns tags from
+   `rules.tags` in the config (e.g. 단백질, 채소위주, 매콤).
+5. **Query-triggered filters** – `configs/menu_rag.json → auto_filters` maps trigger words to
+   metadata constraints: a query containing "샐러드" requires `kind` to contain 샐러드, and
+   "다이어트 / 저칼로리 / 저열량" requires `situation` to contain 다이어트.
+6. **Selection** (`core/select.py`) – candidates below `min_score` are dropped, duplicate titles
+   are removed, and at most `max_per_method` results per cooking method are taken. If the
+   constraints leave fewer than k results, they are relaxed step by step (filter + method + tag →
+   … → score only) to fill k.
+7. **Rule-based explanations** – the highest-priority rule in `rules.reasons` whose conditions
+   (`contains_any` / `equals` / `regex`, combined with `any` / `all`) match the title or key
+   ingredients becomes the reason ("추천 이유"); if none matches, a fixed fallback sentence is used.
+   When an item's cooking method appears only once among the results, a note on the method is added.
+8. **Evidence-tagged passages** – each result is rendered with `passage.template` from the config:
    ```
    [MENU] {title}
    - 종류={kind} | 조리={method} | 상황={situation}
    - 핵심 재료: {ingredients_compact}
    - 근거 ID: {doc_id}
    ```
-   `make_passages.py` / `passage_utils.py` build the same passages for the whole corpus
+   `make_passages.py` / `passage_utils.py` build the same kind of passage for the whole corpus
    (`menu_passages.jsonl`), so a generator can quote and cite them by recipe ID.
 
 ## Repository layout
 
 ```
 core/
-  engine.py          retrieval pipeline (candidates → selection → reasons) used by the CLIs
-  unified_engine.py  wrapper so the CLI and batch script call the same engine entry point
-  retrieval.py       query embedding ("query: " prefix) and cosine top-k helpers
-  select.py          score-ordered selection with method/tag diversity
+  engine.py          the pipeline above (steps 3–8), configured by configs/menu_rag.json
+  unified_engine.py  wrapper so the CLI and the batch script call the same engine entry point
+  retrieval.py       cached model, query embedding ("query: " prefix), cosine top-k
+  select.py          auto-filters, dedupe, method/tag diversity with step-wise relaxation
   rule_engine.py     condition evaluator for reason/tag rules
   enrich.py          ingredient clean-up and key-ingredient extraction
-  render.py          text output (menu, category, tags, ingredients, reason, evidence ID)
+  render.py          text output (filters, menu, category, tags, ingredients, reason, evidence ID)
   io.py, types.py    config loading, RunConfig / RunResult dataclasses
-configs/menu_rag.json  data paths, field names, passage template, auto-filters, reason/tag rules
-local_menu_rag.py      single-query CLI (core engine)
-local_retrieval.py     minimal stand-alone top-k retrieval script
+configs/menu_rag.json  data paths, model, field names, passage template, auto-filters, reason/tag rules
+local_menu_rag.py      single-query CLI
+local_retrieval.py     minimal stand-alone top-k retrieval script (no filters or rules)
 batch_eval.py          runs a JSONL of test queries and writes runs/run_<timestamp>*.json[l]
 build_from_jsonl.py    source JSONL → CSV with doc_text and category columns
 make_passages.py       CSV → evidence-tagged passages (menu_passages.jsonl)
@@ -103,7 +100,7 @@ format, one recipe per line:
               "main_material_group": "…", "servings": "…", "ingredients_keywords": "…"}}
 ```
 
-Rebuild the derived files from it (run everything from the repository root; paths are relative):
+Rebuild the derived files from it (run from the repository root):
 
 ```bash
 python build_from_jsonl.py --input recipes_rag_with_metadata.jsonl --out_csv recipes_output_fixed.csv
@@ -116,73 +113,88 @@ python make_passages.py --meta recipe_meta.csv --out menu_passages.jsonl
 ```bash
 pip install -r requirements.txt
 
-# single query, stand-alone retrieval
+# one query: filters, method diversity, rule-based reasons
+python local_menu_rag.py --q "다이어트 저칼로리 샐러드" --k 7 --min_score 0.82 --diversify_method --max_per_method 1 --generate_rule
+
+# the same query as evidence-tagged passages (what a generator would receive)
+python local_menu_rag.py --q "다이어트 저칼로리 샐러드" --k 7 --diversify_method --passages
+
+# batch evaluation over test_queries.jsonl
+python batch_eval.py --queries test_queries.jsonl
+
+# minimal retrieval only
 python local_retrieval.py --q "매콤한 닭요리 추천" --k 5
-
-# single query through the core engine (method diversity, evidence IDs)
-python local_menu_rag.py --q "다이어트 저칼로리 샐러드" --k 7 --diversify_method --max_per_method 1 --generate_rule
-
-# batch evaluation
-python batch_eval.py --queries test_queries.jsonl --generate_rule
 ```
 
-The first call downloads `intfloat/multilingual-e5-large` (~2.2 GB) from Hugging Face.
-Query embedding runs on CPU; the document embeddings were computed once on a GPU.
+The first call downloads `intfloat/multilingual-e5-large` (~2.2 GB) from Hugging Face. Query
+embedding runs on CPU; the 18-query batch took about 2 minutes on CPU (including the model load). The document
+embeddings were computed once on a GPU.
 
-## Batch evaluation (2026-01-12)
+## Batch evaluation
 
 `test_queries.jsonl` holds 18 Korean queries in eight groups (diet/salad, spicy chicken, quick meals,
 soups, vegetarian/tofu, family, guests, late-night snacks), each with its own `k` (5 or 7),
-`min_score` (0.80 or 0.82) and method-diversity setting. The tracked summary
-`runs/run_20260112_214047_summary.json` reports:
+`min_score` (0.80 or 0.82) and method-diversity setting.
 
-| Metric | Value |
-| --- | --- |
-| Queries | 18 |
-| Average results returned | 6.67 (every query returned its requested k: 15 × 7, 3 × 5) |
-| Average cosine score (mean of per-query means) | 0.851 |
-| Failed queries | 0 |
+| Metric | 2026-01-12 (original code) | 2026-11-24 (restored code) |
+| --- | --- | --- |
+| Queries | 18 | 18 |
+| Average results returned | 6.67 | 6.67 |
+| Average cosine score (mean of per-query means) | 0.851 | 0.851 |
+| Queries returning fewer than k | 0 | 0 |
+| Queries where a filter fired | 4 | 4 |
 
-Three runs on that day (`run_20260112_011529`, `_012015`, `_214047`) returned identical results.
-In that run the auto-filters fired for the four diet/salad queries (`kind = 샐러드`,
-`situation = 다이어트`). Of the 15 queries with `max_per_method = 1`, 10 returned 7 different
-cooking methods, the four salad queries returned 6, and "따뜻한 국/탕 추천" returned 1 (when too few
-methods are available the limit is relaxed to fill k). There are no relevance labels, so these numbers describe coverage and
+Summaries: `runs/run_20260112_214047_summary.json` and `runs/run_20261124_182545_summary.json`.
+In the 2026-11-24 run:
+
+- Every query returned its requested k (15 × 7, 3 × 5); the selected recipes and their order are
+  identical to the 2026-01-12 run for all 18 queries.
+- The filters fired for the four diet/salad queries (`kind = 샐러드`, `situation = 다이어트`), and all
+  7 results of each of those queries satisfy both constraints.
+- Of the 15 queries with `max_per_method = 1`, 10 returned 7 different cooking methods, the four
+  salad queries returned 6, and "따뜻한 국/탕 추천" returned 1 (almost every soup is 끓이기, so the
+  limit was relaxed to fill k).
+- 77 of the 120 results got a rule-based reason; the other 43 got the fallback sentence. 100 of
+  120 got at least one tag.
+
+There are no relevance labels, so these numbers describe coverage, constraint satisfaction and
 similarity scores, not retrieval accuracy.
 
-## Known issues
+## What changed and why (2026-11-24)
 
-These were found while preparing the repository and are left unfixed so that the code is
-published as it was written.
+The code was refactored on 2026-01-13 (a common entry point for the CLI and the batch script), and
+the refactor was left unfinished: the 2026-01-12 runs show filters, reasons and tags, but the
+refactored code no longer produced them. This update reconnects them.
 
-- **Filters and rules not connected.** `core/engine.py` only loads a config named
-  `config.json`/`settings.json`/… from the working directory, so `configs/menu_rag.json` is not
-  read by the engine; `core/rule_engine.py` has no function with the names the engine looks up,
-  so reasons fall back to a fixed sentence and no guardrail is applied; `core/enrich.py` is never
-  called. The January runs were produced by an earlier version of the engine that did use them.
-  The "선정 기준: (자동 가드레일) …" header printed by `core/render.py` is inferred from the first
-  result's category, not from a filter that was applied.
-- **`core/select.py`** uses `sorted_candidates` before it is assigned, so the call fails and the
-  engine falls back to its own method-diversity selection (`_select_with_diversity`).
-- **Query prefix.** The engine's fallback query embedding does not add the `"query: "` prefix that
-  e5 expects (and `local_retrieval.py` and `core/retrieval.py` do add), and it reloads the model for
-  every query.
-- **`batch_eval.py`** does not skip the `#` comment lines in `test_queries.jsonl` and stops with a
-  JSON error; remove those lines (or run on a copy without them) to use it. The current version also
-  writes a simpler summary (`total`, `avg_returned`) than the January summaries.
-- Scripts use paths relative to the working directory, so run them from the repository root.
+| Problem in the 2026-01-13 code | Change |
+| --- | --- |
+| The engine looked for `config.json` in the working directory, so `configs/menu_rag.json` was never read. | `core/engine.py` loads `configs/menu_rag.json` (or `--config`); data paths in it are resolved from the repository root. |
+| The engine looked up functions by guessed names (`make_rule_answer`, `extract_guardrail`, `enrich`, …) that do not exist, so filters, reasons, tags and ingredient clean-up were silently skipped. | `core/engine.py` calls the existing functions directly: `infer_auto_filters`, `attach_filter_ok`, `select_guarded`, `enrich_doc`, `infer_tags`, `pick_best_reason`. |
+| `core/select.py` used a variable before assigning it, so every call failed and a simpler fallback was used. | Restored the 2026-01-12 `core/select.py` (auto-filters, dedupe by title, method/tag limits with step-wise relaxation). |
+| The query was embedded without the `"query: "` prefix that E5 expects (documents use `"passage: "`), and the 2 GB model was reloaded for every query. | `core/retrieval.py` adds the prefix and caches the model (`functools.lru_cache`). |
+| `batch_eval.py` stopped at the `#` comment lines in `test_queries.jsonl`. | Comment and blank lines are skipped; per-query `generate_rule` is honoured; the summary again reports average score and failures. |
+| The method note ("조리 방법이 …이라 다른 후보와 스타일이 달라…") was added to every result, even when several results share the method. | Added only when the item's method is unique among the results. |
+| The "(자동 가드레일)" header was guessed from the first result. | The header lists the filters that were actually applied ("(자동 필터)"). |
+
+The agreement with the 2026-01-12 run (same recipes, same order, same average score) is the check
+that the restored pipeline behaves like the original one.
 
 ## Limitations
 
 - Ranking uses only embedding similarity; there is no BM25/hybrid retrieval and no re-ranker.
 - No labelled relevance judgements, so retrieval quality is not measured (no recall@k or nDCG).
+- Only two filter rules exist (salad, diet), so filters fire for 4 of the 18 test queries.
 - Category labels (kind/situation/method) come from the source data and are noisy
   (e.g. a chicken skewer labelled as dessert), which affects filters and diversity.
-- Reason and tag rules are hand-written keyword rules for a few ingredient families.
+- Reason and tag rules are hand-written keyword rules for a few ingredient families; 43 of 120
+  results in the batch run fall back to the generic sentence, and keyword matches can be loose
+  (e.g. "고추" in 마른 홍고추 tags a pasta salad as 매콤).
 - 5,000 recipes, brute-force cosine search in NumPy; no approximate index.
+- `batch_eval.py` writes to `runs/` relative to the working directory, and the data-preparation
+  scripts use relative default paths, so run them from the repository root.
 
 ## Next step
 
-Connect the filters and reason/tag rules to the current engine again, then plug an LLM generator
-onto the evidence-tagged passages: give it the top-k passages and ask for an answer that cites the
-`근거 ID` of every recipe it recommends, so each claim can be traced to a retrieved document.
+Plug an LLM generator onto the evidence-tagged passages: give it the top-k passages
+(`--passages` output) and ask for an answer that cites the `근거 ID` of every recipe it recommends,
+so each claim can be traced to a retrieved document.

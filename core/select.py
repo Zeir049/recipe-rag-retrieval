@@ -1,124 +1,119 @@
-from __future__ import annotations
-
-from collections import Counter
-from typing import Any, Dict, List, Optional, Tuple
-
-
-def _to_str(x: Any, default: str = "-") -> str:
-    if x is None:
-        return default
-    s = str(x).strip()
-    return s if s else default
+# core/select.py
+from typing import Any, Dict, List, Tuple
+from collections import defaultdict
 
 
-def _normalize_tags(item: Dict[str, Any]) -> List[str]:
-    """
-    태그 후보:
-    - tags / tag / 태그  (list or str)
-    - 없으면 main_material_group를 태그처럼 사용
-    """
-    t = item.get("tags") or item.get("tag") or item.get("태그")
-
-    if isinstance(t, list):
-        tags = [_to_str(x) for x in t if _to_str(x) != "-"]
-        return tags
-
-    if isinstance(t, str):
-        parts = [p.strip() for p in t.replace("/", ",").split(",")]
-        tags = [p for p in parts if p]
-        return tags
-
-    fallback = item.get("main_material_group")
-    if fallback is not None:
-        return [_to_str(fallback)]
-
-    return []
+def _contains(field_value: str, required_value: str) -> bool:
+    if not required_value:
+        return True
+    fv = (field_value or "").strip().lower()
+    rv = (required_value or "").strip().lower()
+    if not fv or not rv:
+        return False
+    return rv in fv
 
 
-def _primary_tag(item: Dict[str, Any]) -> str:
-    tags = _normalize_tags(item)
-    return tags[0] if tags else "-"
+def infer_auto_filters(query: str, auto_filters: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
+    q = (query or "")
+    applied: List[Tuple[str, str]] = []
+    for af in auto_filters or []:
+        triggers = af.get("trigger_contains", []) or []
+        field = str(af.get("field", "")).strip()
+        value = str(af.get("value", "")).strip()
+        if not field or not value:
+            continue
+        if any(t in q for t in triggers):
+            applied.append((field, value))
+    return applied
 
 
-def select(
+def attach_filter_ok(docs: List[Dict[str, Any]], required: List[Tuple[str, str]]) -> None:
+    if not required:
+        for d in docs:
+            d["filter_ok"] = True
+        return
+
+    for d in docs:
+        ok = True
+        for field, value in required:
+            ok = ok and _contains(str(d.get(field, "")), value)
+        d["filter_ok"] = bool(ok)
+
+
+def select_guarded(
     candidates: List[Dict[str, Any]],
-    k: int = 7,
-    diversify_method: bool = False,
-    max_per_method: int = 999,
+    k: int,
+    dedupe_field: str,
+    diversify: bool,
+    diversify_field: str,
+    max_per_value: int,
+    min_score: float,
     diversify_tag: bool = False,
-    max_per_tag: int = 999,
-    guard_kind: str | None = None,
-    guard_situation: str | None = None,
+    max_per_tag: int = 2,
+    tag_field: str = "primary_tag",
 ) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    cnt_field = defaultdict(int)
+    cnt_tag = defaultdict(int)
 
-        # 0) guardrail 필터: kind/situation이 지정되면 그 범위만 먼저 선택
-    filtered = sorted_candidates
-    if guard_kind:
-        filtered = [it for it in filtered if _to_str(it.get("kind")) == guard_kind]
-    if guard_situation:
-        filtered = [it for it in filtered if _to_str(it.get("situation")) == guard_situation]
+    def key(it: Dict[str, Any]) -> str:
+        v = str(it.get(dedupe_field, "")).strip().lower()
+        return v if v else f"__idx__{it.get('idx')}"
 
-    # guardrail로 너무 줄어서 k를 못 채우면, 원본으로 fallback
-    base = filtered if len(filtered) >= kk else sorted_candidates
+    def can_take(it: Dict[str, Any], enforce_filter: bool, enforce_div: bool, enforce_tag: bool) -> bool:
+        if float(it.get("score", 0.0)) < float(min_score):
+            return False
+        if enforce_filter and not bool(it.get("filter_ok", True)):
+            return False
 
-    """
-    후보(candidates)에서 최종 k개 선택.
-    - 점수(score) 높은 순으로 우선 선택
-    - diversify_method면 method 중복을 max_per_method 이하로 제한
-    - diversify_tag면 (태그 or main_material_group) 중복을 max_per_tag 이하로 제한
-    - 제한 때문에 k개가 안 채워지면, 남은 후보로 제한을 완화해 채움
-    """
-    if not candidates:
-        return []
+        k_ = key(it)
+        if k_ in seen:
+            return False
 
-    kk = int(k)
+        if enforce_div and diversify:
+            v = str(it.get(diversify_field, "")).strip()
+            if cnt_field[v] >= max_per_value:
+                return False
 
-    sorted_candidates = sorted(
-        candidates,
-        key=lambda x: float(x.get("score", 0.0)),
-        reverse=True,
-    )
+        if enforce_tag and diversify_tag:
+            t = str(it.get(tag_field, "")).strip()
+            if t:
+                if cnt_tag[t] >= max_per_tag:
+                    return False
 
-    method_cnt = Counter()
-    tag_cnt = Counter()
+        return True
 
-    picked: List[Dict[str, Any]] = []
-    picked_ids = set()
+    def take(it: Dict[str, Any]):
+        out.append(it)
+        seen.add(key(it))
 
-    # 1차: 제한을 모두 지키면서 채우기
-    for it in sorted_candidates:
-        obj_id = id(it)
-        if obj_id in picked_ids:
-            continue
+        v = str(it.get(diversify_field, "")).strip()
+        cnt_field[v] += 1
 
-        m = _to_str(it.get("method"))
-        t = _primary_tag(it)
+        t = str(it.get(tag_field, "")).strip()
+        if t:
+            cnt_tag[t] += 1
 
-        if diversify_method and method_cnt[m] >= int(max_per_method):
-            continue
-        if diversify_tag and tag_cnt[t] >= int(max_per_tag):
-            continue
+    # 단계적으로 완화하면서 k개 채우기
+    phases = [
+        (True,  True,  True),   # filter + div + tag
+        (True,  True,  False),  # filter + div
+        (True,  False, True),   # filter + tag
+        (True,  False, False),  # filter only
+        (False, True,  True),   # div + tag
+        (False, True,  False),  # div only
+        (False, False, True),   # tag only
+        (False, False, False)   # fallback
+    ]
 
-        picked.append(it)
-        picked_ids.add(obj_id)
-
-        if diversify_method:
-            method_cnt[m] += 1
-        if diversify_tag:
-            tag_cnt[t] += 1
-
-        if len(picked) >= kk:
-            return picked
-
-    # 2차: k가 안 채워지면 제한을 완화해서 채우기(중복 허용)
-    if len(picked) < kk:
-        for it in sorted_candidates:
-            obj_id = id(it)
-            if obj_id in picked_ids:
-                continue
-            picked.append(it)
-            picked_ids.add(obj_id)
-            if len(picked) >= kk:
+    for enforce_filter, enforce_div, enforce_tag in phases:
+        if len(out) >= k:
+            break
+        for it in candidates:
+            if len(out) >= k:
                 break
+            if can_take(it, enforce_filter, enforce_div, enforce_tag):
+                take(it)
 
-    return picked
+    return out[:k]

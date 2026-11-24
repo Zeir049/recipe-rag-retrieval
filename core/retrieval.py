@@ -1,5 +1,7 @@
 # core/retrieval.py
+from functools import lru_cache
 from typing import Tuple
+
 import numpy as np
 
 
@@ -8,10 +10,18 @@ def l2_normalize(x: np.ndarray, axis: int = -1, eps: float = 1e-12) -> np.ndarra
     return x / np.maximum(norm, eps)
 
 
-def embed_query_sentence_transformers(query: str, model_name: str, e5_prefix: bool = True) -> np.ndarray:
+@lru_cache(maxsize=2)
+def get_model(model_name: str):
+    """Load the sentence-transformers model once per process (it is ~2 GB)."""
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer(model_name)
+    return SentenceTransformer(model_name)
+
+
+def embed_query_sentence_transformers(query: str, model_name: str, e5_prefix: bool = True) -> np.ndarray:
+    model = get_model(model_name)
+    # E5 models are trained with "query: " / "passage: " prefixes; documents were
+    # embedded with "passage: " (embedding.ipynb), so queries need "query: ".
     q = ("query: " + query) if e5_prefix else query
     vec = model.encode([q], normalize_embeddings=False)
     return vec.astype(np.float32)[0]

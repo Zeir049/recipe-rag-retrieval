@@ -1,161 +1,108 @@
 import argparse
 import json
 import os
-import sys
 from datetime import datetime
 
+from core.engine import DEFAULT_CONFIG, get_config
+from core.render import render
 from core.types import RunConfig
 from core.unified_engine import UnifiedEngine
 
-# local_menu_rag.py와 동일한 safe_load_config 로직(복사)
-import inspect
-
-
-def safe_load_config(config_path: str | None = None) -> dict:
-    try:
-        from core.io import load_config
-    except Exception as e:
-        print(f"[WARN] core.io import 실패: {e}", file=sys.stderr)
-        return {}
-
-    candidates: list[str] = []
-    if config_path:
-        candidates.append(config_path)
-    candidates += ["config.json", "config.yaml", "config.yml", "settings.json", "rag_config.json"]
-
-    try:
-        sig = inspect.signature(load_config)
-        if len(sig.parameters) == 0:
-            return load_config() or {}
-    except Exception:
-        pass
-
-    for p in candidates:
-        try:
-            if not p:
-                continue
-            if not os.path.exists(p):
-                continue
-
-            try:
-                return load_config(p) or {}
-            except TypeError:
-                pass
-
-            for kw in ("path", "config_path", "filepath", "file"):
-                try:
-                    return load_config(**{kw: p}) or {}
-                except TypeError:
-                    continue
-
-        except FileNotFoundError:
-            continue
-        except Exception as e:
-            print(f"[WARN] load_config 실패 ({p}): {e}", file=sys.stderr)
-            return {}
-
-    return {}
-
 
 def read_jsonl(path: str):
+    """One JSON object per line; blank lines and lines starting with '#' are skipped."""
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if not line:
+            if not line or line.startswith("#"):
                 continue
             yield json.loads(line)
 
 
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
-
-
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--queries", required=True, help="test_queries.jsonl 경로")
-    ap.add_argument("--generate_rule", action="store_true")
-    ap.add_argument("--config", default=None, help="(선택) config 파일 경로")
+    ap = argparse.ArgumentParser(description="Run a JSONL file of test queries.")
+    ap.add_argument("--queries", required=True, help="test_queries.jsonl")
+    ap.add_argument("--generate_rule", action="store_true", help="force rule-based reasons for every query")
+    ap.add_argument("--config", default=DEFAULT_CONFIG)
+    ap.add_argument("--out_dir", default="runs")
     args = ap.parse_args()
 
-    cfg_dict = safe_load_config(args.config)
-    default_k = int(cfg_dict.get("k", 7))
-    default_min_score = float(cfg_dict.get("min_score", 0.0))
+    cfg_dict = get_config(args.config)
+    default_min_score = float(cfg_dict.get("selection", {}).get("min_score_default", 0.0))
+    default_max_per_method = int(cfg_dict.get("diversity", {}).get("max_per_value_default", 1))
+    default_max_per_tag = int(cfg_dict.get("diversity_tags", {}).get("max_per_tag_default", 2))
 
     engine = UnifiedEngine()
 
     run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    ensure_dir("runs")
-    run_path = os.path.join("runs", f"run_{run_ts}.jsonl")
-    summary_path = os.path.join("runs", f"run_{run_ts}_summary.json")
+    os.makedirs(args.out_dir, exist_ok=True)
+    run_path = os.path.join(args.out_dir, f"run_{run_ts}.jsonl")
+    summary_path = os.path.join(args.out_dir, f"run_{run_ts}_summary.json")
 
     records = []
-    total = 0
-
     for idx, obj in enumerate(read_jsonl(args.queries), 1):
         q = obj.get("q") or obj.get("query")
         if not q:
-            raise ValueError(f"queries jsonl에서 q/query 필드가 없습니다: {obj}")
-
-        k = int(obj.get("k", default_k))
-        min_score = float(obj.get("min_score", default_min_score))
+            raise ValueError(f"query line without 'q': {obj}")
 
         cfg = RunConfig(
-            k=k,
-            min_score=min_score,
-            generate_rule=bool(args.generate_rule),
-            only_answer=False,
-            diversify_method=bool(obj.get("diversify_method", cfg_dict.get("diversify_method", False))),
-            max_per_method=int(obj.get("max_per_method", cfg_dict.get("max_per_method", 999))),
-            diversify_tag=bool(obj.get("diversify_tag", cfg_dict.get("diversify_tag", False))),
-            max_per_tag=int(obj.get("max_per_tag", cfg_dict.get("max_per_tag", 999))),
+            k=int(obj.get("k", 7)),
+            min_score=float(obj.get("min_score", default_min_score)),
+            generate_rule=bool(args.generate_rule or obj.get("generate_rule", False)),
+            diversify_method=bool(obj.get("diversify_method", False)),
+            max_per_method=int(obj.get("max_per_method", default_max_per_method)),
+            diversify_tag=bool(obj.get("diversify_tag", False)),
+            max_per_tag=int(obj.get("max_per_tag", default_max_per_tag)),
+            extra={"config_path": args.config},
         )
-
         result = engine.run(q, cfg)
-        total += 1
 
-        returned = len(result.selected)
-        top1_item = result.selected[0] if returned > 0 else {}
-        top1 = top1_item.get("name") or top1_item.get("menu") or top1_item.get("title") or "-"
-        score = top1_item.get("score") or top1_item.get("sim") or top1_item.get("similarity")
-
-        methods = []
-        for it in result.selected:
-            m = it.get("method") or it.get("cook_method") or it.get("조리") or it.get("조리방법")
-            if m is not None:
-                methods.append(str(m))
-        uniq_methods = len(set(methods)) if methods else 0
-
-        print(f"[{idx}] returned={returned}/{k} top1='{top1}' score={score if score is not None else '-'} uniq_methods={uniq_methods}")
-
+        items = result.selected
+        scores = [float(it["score"]) for it in items]
+        applied = (result.guardrail or {}).get("applied_filters", [])
         rec = {
-            "idx": idx,
-            "q": q,
-            "k": k,
-            "min_score": min_score,
-            "returned": returned,
-            "top1": top1,
-            "top1_score": score,
-            "uniq_methods": uniq_methods,
-            "guardrail": result.guardrail,
-            "debug": result.debug,
+            "query": q,
+            "k": cfg.k,
+            "min_score": cfg.min_score,
+            "returned": len(items),
+            "avg_score": sum(scores) / len(scores) if scores else None,
+            "uniq_methods": len({it.get("method") for it in items}),
+            "applied_filters": applied,
+            "items_passing_filters": sum(1 for it in items if it.get("filter_ok")) if applied else None,
+            "items": [
+                {key: it.get(key) for key in
+                 ("idx", "score", "title", "kind", "method", "situation", "doc_id",
+                  "key_ingredients_list", "tags", "reason", "passage")}
+                for it in items
+            ],
+            "answer": render(result, cfg=cfg),
         }
         records.append(rec)
+
+        top1 = items[0]["title"] if items else "-"
+        print(f"[{idx}] returned={rec['returned']}/{cfg.k} top1='{top1}' "
+              f"score={scores[0] if scores else '-'} uniq_methods={rec['uniq_methods']} filters={applied}")
 
     with open(run_path, "w", encoding="utf-8") as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
+    n = len(records)
+    with_items = [r for r in records if r["avg_score"] is not None]
     summary = {
-        "total": total,
-        "avg_returned": (sum(r["returned"] for r in records) / total) if total else 0.0,
-        "runs_file": run_path,
+        "run_file": run_path,
+        "queries_file": args.queries,
+        "count": n,
+        "avg_returned": sum(r["returned"] for r in records) / n if n else 0.0,
+        "avg_avg_score": sum(r["avg_score"] for r in with_items) / len(with_items) if with_items else None,
+        "fail_count": sum(1 for r in records if r["returned"] < r["k"]),  # fewer than k results
+        "filtered_queries": sum(1 for r in records if r["applied_filters"]),
     }
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
     print("\n=== DONE ===")
-    print(f"- run:     {run_path}")
-    print(f"- summary: {summary_path}")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

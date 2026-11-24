@@ -1,461 +1,186 @@
 # core/engine.py
+"""
+Retrieval pipeline used by local_menu_rag.py and batch_eval.py.
+
+    query
+      -> "query: " + query, multilingual-e5 embedding          (core.retrieval)
+      -> cosine top-(k * pool_multiplier) over the recipe matrix
+      -> clean ingredients, key ingredients                     (core.enrich)
+      -> rule-based tags                                        (core.rule_engine)
+      -> query-triggered filters + dedupe + method diversity    (core.select)
+      -> rule-based reason + evidence-tagged passage per result
+
+Everything that is not code (paths, field names, filters, rules, passage
+template) comes from configs/menu_rag.json.
+"""
 from __future__ import annotations
 
 import os
-import sys
-import json
-import inspect
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
+import pandas as pd
 
-# 선택: pandas가 있으면 meta 로딩 편함
-try:
-    import pandas as pd
-except Exception:
-    pd = None
-
+from .enrich import build_menu_to_ingredients_and_vocab, enrich_doc, safe_str
+from .io import load_config
+from .retrieval import embed_query_sentence_transformers, l2_normalize, topk_cosine
+from .rule_engine import infer_tags, pick_best_reason
+from .select import attach_filter_ok, infer_auto_filters, select_guarded
 from .types import RunConfig
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_CONFIG = os.path.join(REPO_ROOT, "configs", "menu_rag.json")
+DEFAULT_MODEL = "intfloat/multilingual-e5-large"
+FALLBACK_REASON = "질문과 의미적으로 가까운 후보로 검색되어 추천해요."
 
-# ----------------------------
-# internal cache (lazy loading)
-# ----------------------------
-_CACHE: Dict[str, Any] = {
-    "config": None,
-    "meta": None,            # pd.DataFrame or list/dict
-    "embeddings": None,      # np.ndarray
-    "embeddings_norm": None  # np.ndarray (L2 normalized)
-}
-
-def _select_with_diversity(
-    candidates: List[Dict[str, Any]],
-    k: int,
-    diversify_method: bool,
-    max_per_method: int,
-) -> List[Dict[str, Any]]:
-    if not candidates:
-        return []
-
-    if not diversify_method:
-        return candidates[:k]
-
-    picked: List[Dict[str, Any]] = []
-    method_cnt: Dict[str, int] = {}
-
-    # 1차: 제한 지키면서 담기
-    for it in candidates:
-        m = str(it.get("method") or "-")
-        if method_cnt.get(m, 0) >= max_per_method:
-            continue
-        picked.append(it)
-        method_cnt[m] = method_cnt.get(m, 0) + 1
-        if len(picked) >= k:
-            return picked
-
-    # 2차: 그래도 k가 안 채워지면 남은 것 점수순으로 채우기(제한 완화)
-    if len(picked) < k:
-        already = {id(x) for x in picked}
-        for it in candidates:
-            if id(it) in already:
-                continue
-            picked.append(it)
-            if len(picked) >= k:
-                break
-
-    return picked
+# Loaded once per process and reused for every query.
+_CACHE: Dict[str, Any] = {}
 
 
 # ----------------------------
-# utils
+# loading
 # ----------------------------
-def _safe_import(module_name: str):
-    try:
-        return __import__(module_name, fromlist=["*"])
-    except Exception as e:
-        raise RuntimeError(f"필수 모듈 import 실패: {module_name} / {e}") from e
+def _resolve(path: str) -> str:
+    """Paths in the config are relative to the repository root."""
+    return path if os.path.isabs(path) else os.path.join(REPO_ROOT, path)
 
 
-def _flex_call(fn, *args, **kwargs):
-    """
-    fn 시그니처에 맞는 kwargs만 추려서 호출.
-    """
-    sig = inspect.signature(fn)
-    params = sig.parameters
-    filtered = {k: v for k, v in kwargs.items() if k in params}
-    return fn(*args, **filtered)
+def get_config(config_path: Optional[str] = None) -> Dict[str, Any]:
+    path = config_path or DEFAULT_CONFIG
+    key = ("config", path)
+    if key not in _CACHE:
+        _CACHE[key] = load_config(path)
+    return _CACHE[key]
 
 
-def _get_cfg() -> Dict[str, Any]:
-    """
-    core.io.load_config() 사용 시도. 실패하면 {}.
-    """
-    if _CACHE["config"] is not None:
-        return _CACHE["config"]
+def _load_data(cfg: Dict[str, Any]):
+    data = cfg.get("data", {})
+    key = ("data", data.get("emb_path"), data.get("meta_path"))
+    if key in _CACHE:
+        return _CACHE[key]
 
-    cfg = {}
-    try:
-        from .io import load_config  # 네 프로젝트에 존재(이미 확인됨)
-        # load_config가 인자 없이 되거나, 경로 필요할 수도 있으니 유연하게
-        try:
-            sig = inspect.signature(load_config)
-            if len(sig.parameters) == 0:
-                cfg = load_config() or {}
-            else:
-                # 흔한 파일명 후보만 시도
-                for p in ("config.json", "config.yaml", "config.yml", "settings.json", "rag_config.json"):
-                    if os.path.exists(p):
-                        try:
-                            cfg = load_config(p) or {}
-                            break
-                        except TypeError:
-                            # 키워드 인자 변형
-                            for kw in ("path", "config_path", "filepath", "file"):
-                                try:
-                                    cfg = load_config(**{kw: p}) or {}
-                                    break
-                                except TypeError:
-                                    continue
-        except Exception:
-            cfg = {}
-    except Exception:
-        cfg = {}
+    emb = np.load(_resolve(data.get("emb_path", "recipe_embeddings_e5_large.npy"))).astype(np.float32)
+    emb_norm = l2_normalize(emb, axis=1)
+    meta = pd.read_csv(_resolve(data.get("meta_path", "recipe_meta.csv")),
+                       encoding=data.get("meta_encoding", "utf-8-sig"))
+    if len(meta) != emb.shape[0]:
+        raise RuntimeError(f"meta rows ({len(meta)}) != embedding rows ({emb.shape[0]})")
 
-    if not isinstance(cfg, dict):
-        cfg = {}
-
-    _CACHE["config"] = cfg
-    return cfg
-
-
-def _pick_path(cfg: Dict[str, Any], keys: List[str], fallbacks: List[str]) -> Optional[str]:
-    for k in keys:
-        v = cfg.get(k)
-        if isinstance(v, str) and v.strip() and os.path.exists(v):
-            return v
-    for p in fallbacks:
-        if os.path.exists(p):
-            return p
-    return None
-
-
-def _load_meta(cfg: Dict[str, Any]):
-    """
-    meta csv 로딩. (pandas 있으면 DataFrame)
-    """
-    if _CACHE["meta"] is not None:
-        return _CACHE["meta"]
-
-    meta_path = _pick_path(
-        cfg,
-        keys=["meta_path", "meta_csv", "meta_file", "recipe_meta", "menu_meta"],
-        fallbacks=["recipe_meta.csv", "menu_meta.csv", "meta.csv"]
+    f = cfg.get("fields", {})
+    # used by enrich to fill in ingredients for recipes that have none
+    menu_to_ing, vocab = build_menu_to_ingredients_and_vocab(
+        meta, title_col=f.get("title", "CKG_NM"), ingredients_col=f.get("ingredients", "ingredients_keywords")
     )
-    if meta_path is None:
-        raise RuntimeError("meta csv 파일을 찾지 못했습니다. (recipe_meta.csv 등)")
-
-    if pd is None:
-        # pandas 없으면 최소 로딩(헤더/행 dict 리스트)
-        import csv
-        with open(meta_path, "r", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            meta = list(reader)
-    else:
-        meta = pd.read_csv(meta_path, encoding="utf-8-sig")
-
-    _CACHE["meta"] = meta
-    return meta
-
-
-def load_embeddings_norm(cfg: Optional[Dict[str, Any]] = None) -> np.ndarray:
-    """
-    임베딩 로딩 + L2 정규화 캐시.
-    """
-    if _CACHE["embeddings_norm"] is not None:
-        return _CACHE["embeddings_norm"]
-
-    cfg = cfg or _get_cfg()
-    emb_path = _pick_path(
-        cfg,
-        keys=["embeddings_path", "embed_path", "vector_path", "recipe_embeddings", "menu_embeddings"],
-        fallbacks=["recipe_embeddings_e5_large.npy", "menu_embeddings.npy", "embeddings.npy"]
-    )
-    if emb_path is None:
-        raise RuntimeError("임베딩 npy 파일을 찾지 못했습니다. (recipe_embeddings_e5_large.npy 등)")
-
-    emb = np.load(emb_path)
-    emb = emb.astype(np.float32, copy=False)
-
-    # L2 normalize
-    norms = np.linalg.norm(emb, axis=1, keepdims=True)
-    norms = np.maximum(norms, 1e-12)
-    emb_norm = emb / norms
-
-    _CACHE["embeddings"] = emb
-    _CACHE["embeddings_norm"] = emb_norm
-    return emb_norm
-
-
-def _embed_query(query: str, cfg: Dict[str, Any]) -> np.ndarray:
-    """
-    쿼리 임베딩: 먼저 core.retrieval 쪽 helper가 있으면 그걸 사용.
-    없으면 sentence-transformers로 시도(설치/모델 필요).
-    """
-    retrieval = _safe_import("core.retrieval")
-
-    # 1) retrieval 모듈에 query embedding 함수가 있으면 사용
-    for fn_name in ("embed_query", "encode_query", "encode", "embed", "get_query_embedding"):
-        if hasattr(retrieval, fn_name) and callable(getattr(retrieval, fn_name)):
-            fn = getattr(retrieval, fn_name)
-            try:
-                out = _flex_call(fn, query=query, q=query, text=query, cfg=cfg)
-                vec = np.asarray(out, dtype=np.float32)
-                return vec
-            except Exception:
-                pass
-
-    # 2) sentence_transformers fallback
-    try:
-        from sentence_transformers import SentenceTransformer
-    except Exception as e:
-        raise RuntimeError(
-            "쿼리 임베딩 함수를 찾지 못했고, sentence_transformers도 없습니다.\n"
-            "core/retrieval.py에 embed_query(또는 encode) 같은 함수를 제공하거나, sentence_transformers 설치/모델 설정이 필요합니다."
-        ) from e
-
-    model_name = cfg.get("embed_model") or cfg.get("model_name") or "intfloat/multilingual-e5-large"
-    model = SentenceTransformer(model_name)
-    vec = model.encode([query], normalize_embeddings=False)[0]
-    return np.asarray(vec, dtype=np.float32)
-
-
-def _normalize_vec(vec: np.ndarray) -> np.ndarray:
-    vec = vec.astype(np.float32, copy=False)
-    n = np.linalg.norm(vec)
-    if n < 1e-12:
-        return vec
-    return vec / n
+    _CACHE[key] = (emb_norm, meta, menu_to_ing, vocab)
+    return _CACHE[key]
 
 
 # ----------------------------
-# core pipeline pieces (public)
+# pipeline steps
 # ----------------------------
-def build_candidates(
-    query: str,
-    k: int = 7,
-    min_score: float = 0.0,
-    cfg: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
-    """
-    1) query embedding
-    2) cosine top-k
-    3) candidate dict list 반환 (idx/score 포함)
-    """
-    cfg = cfg or _get_cfg()
-    emb_norm = load_embeddings_norm(cfg)
-    meta = _load_meta(cfg)
+def build_candidates(query: str, pool_k: int, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Embed the query and return the pool_k most similar recipes as docs."""
+    emb_norm, meta, menu_to_ing, vocab = _load_data(cfg)
+    f = cfg.get("fields", {})
+    out_cfg = cfg.get("output", {})
+    model_name = cfg.get("data", {}).get("embed_model", DEFAULT_MODEL)
 
-    qv = _embed_query(query, cfg)
-    qv = _normalize_vec(qv)
+    qv = embed_query_sentence_transformers(query, model_name, e5_prefix=True)
+    idxs, scores = topk_cosine(emb_norm, qv, k=pool_k)
 
-    # cosine: (N, D) dot (D,)
-    sims = emb_norm @ qv
-    # top-k 후보는 selection/diversify에서 더 필요할 수 있어 약간 여유로 뽑는 걸 권장
-    probe_k = max(k * 5, k)
-    idxs = np.argpartition(-sims, min(probe_k, len(sims) - 1))[:probe_k]
-    idxs = idxs[np.argsort(-sims[idxs])]
-
-    candidates: List[Dict[str, Any]] = []
-    for idx in idxs:
-        score = float(sims[idx])
-        if score < float(min_score):
-            continue
-
-        item: Dict[str, Any] = {"idx": int(idx), "score": score}
-
-        # meta 붙이기(가능하면)
-        try:
-            if pd is not None and hasattr(meta, "iloc"):
-                row = meta.iloc[int(idx)].to_dict()
-                item.update(row)
-            elif isinstance(meta, list) and int(idx) < len(meta):
-                item.update(meta[int(idx)])
-        except Exception:
-            pass
-
-        candidates.append(item)
-
-        if len(candidates) >= probe_k:
-            break
-
-    return candidates
+    docs = []
+    for idx, score in zip(idxs, scores):
+        row = meta.iloc[int(idx)]
+        doc = {
+            "idx": int(idx),
+            "score": float(score),
+            "title": safe_str(row.get(f.get("title", "CKG_NM"))),
+            "kind": safe_str(row.get(f.get("kind", "kind"))),
+            "method": safe_str(row.get(f.get("method", "method"))),
+            "situation": safe_str(row.get(f.get("situation", "situation"))),
+            "doc_id": safe_str(row.get(f.get("doc_id", "RCP_SNO"))),
+            "ingredients": row.get(f.get("ingredients", "ingredients_keywords")),
+        }
+        enrich_doc(
+            doc, menu_to_ing, vocab,
+            max_ing_in_passage=int(cfg.get("passage", {}).get("key_ingredients_max", 10)),
+            key_ing_topn=int(out_cfg.get("key_ingredients_topn", 5)),
+        )
+        tags = infer_tags(doc, cfg.get("rules", {}).get("tags", []))
+        doc["tags"] = tags
+        doc["primary_tag"] = tags[0] if tags else ""
+        docs.append(doc)
+    return docs
 
 
-def make_rule_answer(item: Dict[str, Any], query: str, cfg: Dict[str, Any]) -> str:
-    """
-    rule_engine 기반 ‘추천 이유’ 생성.
-    (rule_engine의 함수명이 달라도 최대한 찾아서 호출)
-    """
-    rule_engine = _safe_import("core.rule_engine")
+def make_reason(doc: Dict[str, Any], selected: List[Dict[str, Any]], cfg: Dict[str, Any]) -> str:
+    """Highest-priority matching reason rule, plus a note when the cooking method is unique."""
+    rule = pick_best_reason(doc, cfg.get("rules", {}).get("reasons", []))
+    text = str(rule["text"]) if rule else FALLBACK_REASON
 
-    # 흔한 함수명 후보
-    for fn_name in ("make_rule_answer", "build_rule_answer", "rule_answer", "generate_reason", "make_reason"):
-        if hasattr(rule_engine, fn_name) and callable(getattr(rule_engine, fn_name)):
-            fn = getattr(rule_engine, fn_name)
-            try:
-                return str(_flex_call(fn, item=item, query=query, cfg=cfg))
-            except Exception:
-                pass
-
-    # fallback: 최소 텍스트
-    name = item.get("name") or item.get("menu") or item.get("title") or "메뉴"
-    return f"{name}는 요청과 잘 맞는 후보예요."
+    if cfg.get("output", {}).get("include_method_choice_line", False):
+        method = doc.get("method", "")
+        if method and sum(1 for d in selected if d.get("method") == method) == 1:
+            text += f" 조리 방법이 **{method}**이라 다른 후보와 스타일이 달라 선택폭이 넓어져요."
+    return text
 
 
-def run_engine(
-    query: str,
-    k: int = 7,
-    min_score: float = 0.0,
-    generate_rule: bool = False,
-    only_answer: bool = False,
-    diversify_method: bool = False,
-    max_per_method: int = 999,
-    diversify_tag: bool = False,
-    max_per_tag: int = 999,
-) -> Dict[str, Any]:
-    """
-    기존 코어 파이프라인 진입점(너 파일에 원래 있던 이름).
-    - candidates 생성
-    - select로 최종 k개 선택/다양화
-    - enrich로 출력용 필드 보강
-    - (옵션) rule_engine로 추천 이유 생성
-    - dict 반환
-    """
-    cfg = _get_cfg()
-    meta = _load_meta(cfg)
-
-    guard_kind = None
-    guard_situation = None
-    try:
-        rule_engine = _safe_import("core.rule_engine")
-        for fn_name in ("extract_guardrail", "infer_guardrail", "make_guardrail", "get_guardrail"):
-            if hasattr(rule_engine, fn_name) and callable(getattr(rule_engine, fn_name)):
-                g = _flex_call(getattr(rule_engine, fn_name), query=query, cfg=cfg)
-                if isinstance(g, dict):
-                    guard_kind = g.get("kind")
-                    guard_situation = g.get("situation")
-                break
-    except Exception:
-        pass
-
-
-    candidates = build_candidates(query=query, k=k, min_score=min_score, cfg=cfg)
-
-    # --- select 단계 ---
-    select_mod = _safe_import("core.select")
-    selected: List[Dict[str, Any]] = candidates
-    #
-    # select 단계가 실패/미적용이면 fallback 적용
-# (selected가 그냥 candidates 그대로인 경우가 많아서, diversify_method 켰을 때만 fallback)
-    # select 모듈에 선택 함수가 있으면 사용(없으면 candidates에서 앞 k개)
-    for fn_name in ("select", "select_items", "pick", "choose", "run_select"):
-        if hasattr(select_mod, fn_name) and callable(getattr(select_mod, fn_name)):
-            fn = getattr(select_mod, fn_name)
-            try:
-                selected = _flex_call(
-                    fn,
-                    candidates=candidates,
-                    items=candidates,
-                    k=k,
-                    diversify_method=diversify_method,
-                    max_per_method=max_per_method,
-                    diversify_tag=diversify_tag,
-                    max_per_tag=max_per_tag,
-                    guard_kind=guard_kind,
-                    guard_situation=guard_situation,
-
-                )
-                break
-            except Exception:
-                continue
-
-    if not isinstance(selected, list):
-        selected = candidates
-# select 모듈이 다양화를 안 해주거나 실패했을 때를 대비한 fallback
-    if diversify_method:
-        selected = _select_with_diversity(
-            candidates=candidates,
-            k=int(k),
-            diversify_method=bool(diversify_method),
-            max_per_method=int(max_per_method),
+def make_passage(doc: Dict[str, Any], cfg: Dict[str, Any]) -> str:
+    """Evidence-tagged passage for a generator: ends with the recipe ID it came from."""
+    template = cfg.get("passage", {}).get(
+        "template",
+        "[MENU] {title}\n- 종류={kind} | 조리={method} | 상황={situation}\n"
+        "- 핵심 재료: {ingredients_compact}\n- 근거 ID: {doc_id}\n",
     )
-    else:
-        selected = selected[: int(k)]
+    fields = {k: (doc.get(k) or "-") for k in ("title", "kind", "method", "situation", "ingredients_compact", "doc_id")}
+    return template.format(**fields).rstrip()
 
 
-    # --- enrich 단계 ---
-    enrich_mod = _safe_import("core.enrich")
-    for fn_name in ("enrich", "enrich_items", "apply", "run_enrich"):
-        if hasattr(enrich_mod, fn_name) and callable(getattr(enrich_mod, fn_name)):
-            fn = getattr(enrich_mod, fn_name)
-            try:
-                enriched = _flex_call(fn, items=selected, selected=selected, meta=meta, cfg=cfg, query=query)
-                if isinstance(enriched, list):
-                    selected = enriched
-                break
-            except Exception:
-                continue
+def run_engine(query: str, rc: RunConfig, config_path: Optional[str] = None) -> Dict[str, Any]:
+    cfg = get_config(config_path)
+    sel_cfg = cfg.get("selection", {})
+    div_cfg = cfg.get("diversity", {})
 
-    # --- rule answer ---
-    if generate_rule:
-        for it in selected:
-            # 이미 reason이 있으면 유지
-            if "추천 이유" in it and it["추천 이유"]:
-                continue
-            if "reason" in it and it["reason"]:
-                continue
-            reason = make_rule_answer(it, query=query, cfg=cfg)
-            it["reason"] = reason
+    k = int(rc.k)
+    pool_k = k * int(sel_cfg.get("pool_multiplier", 10))
+    candidates = build_candidates(query, pool_k, cfg)
 
-    # --- guardrail(가능하면 rule_engine에서) ---
-    guardrail = None
-    try:
-        rule_engine = _safe_import("core.rule_engine")
-        for fn_name in ("extract_guardrail", "infer_guardrail", "make_guardrail", "get_guardrail"):
-            if hasattr(rule_engine, fn_name) and callable(getattr(rule_engine, fn_name)):
-                guardrail = _flex_call(getattr(rule_engine, fn_name), query=query, cfg=cfg)
-                break
-    except Exception:
-        guardrail = None
+    # query-triggered filters, e.g. "샐러드" in the query -> kind contains "샐러드"
+    applied = infer_auto_filters(query, cfg.get("auto_filters", []))
+    attach_filter_ok(candidates, applied)
 
-    debug = {
-        "returned": len(selected),
-    }
+    selected = select_guarded(
+        candidates,
+        k=k,
+        dedupe_field=sel_cfg.get("dedupe_field", "title"),
+        diversify=bool(rc.diversify_method),
+        diversify_field=div_cfg.get("field", "method"),
+        max_per_value=int(rc.max_per_method),
+        min_score=float(rc.min_score),
+        diversify_tag=bool(rc.diversify_tag),
+        max_per_tag=int(rc.max_per_tag),
+        tag_field="primary_tag",
+    )
+
+    for doc in selected:
+        if rc.generate_rule:
+            doc["reason"] = make_reason(doc, selected, cfg)
+        doc["passage"] = make_passage(doc, cfg)
 
     return {
         "query": query,
         "selected": selected,
-        "guardrail": guardrail,
-        "debug": debug,
+        "guardrail": {"applied_filters": [list(x) for x in applied]} if applied else None,
+        "debug": {
+            "returned": len(selected),
+            "pool": len(candidates),
+            "filter_ok_in_pool": sum(1 for d in candidates if d.get("filter_ok")),
+        },
     }
 
 
 # ============================================================
-# Unified entrypoint for CLI/batch
+# Entry point used by core.unified_engine.UnifiedEngine
 # ============================================================
 def run(query: str, cfg: RunConfig):
-    """
-    UnifiedEngine이 호출할 표준 진입점.
-    내부적으로 기존 run_engine을 그대로 호출한다.
-    """
-    return run_engine(
-        query,
-        k=cfg.k,
-        min_score=cfg.min_score,
-        generate_rule=cfg.generate_rule,
-        only_answer=cfg.only_answer,
-        diversify_method=cfg.diversify_method,
-        max_per_method=cfg.max_per_method,
-        diversify_tag=cfg.diversify_tag,
-        max_per_tag=cfg.max_per_tag,
-    )
+    return run_engine(query, cfg, config_path=(cfg.extra or {}).get("config_path"))
