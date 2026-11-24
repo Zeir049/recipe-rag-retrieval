@@ -90,9 +90,17 @@ The recipe data and everything derived from it are **not included** (see `.gitig
 
 The corpus is 5,000 Korean recipes with a recipe serial number (`RCP_SNO`), dish name
 (`CKG_NM`), an ingredient string and category labels for dish kind, situation, cooking method and
-main ingredient group. It comes from a third-party Korean recipe dataset whose redistribution terms
-are not confirmed, so it is not redistributed here. To run the code you need a JSONL file in this
-format, one recipe per line:
+main ingredient group. It was assembled from two open recipe sources:
+
+- **AI 데이터 허브** (AI data hub) open data
+- **임성근 셰프 공개 레시피 데이터** (open recipe data of chef Lim Seong-geun)
+
+Licence not confirmed for either source, so the raw data and everything derived from it stay out
+of this repository. The project starts from one merged file, `recipes_rag_with_metadata.jsonl`;
+neither the code, the notebook nor the data records which recipe came from which source (all 5,000
+records share one schema and have no source field).
+
+To run the code you need a JSONL file in this format, one recipe per line:
 
 ```json
 {"id": 123, "text": "요리명: …\n카테고리: <kind> / <situation> / <method>\n주재료군: …\n재료: …\n인분: …",
