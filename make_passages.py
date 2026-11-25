@@ -1,5 +1,6 @@
 # make_passages.py
 import argparse
+import json
 import pandas as pd
 from passage_utils import build_menu_passage
 
@@ -15,9 +16,9 @@ def main():
     with open(args.out, "w", encoding="utf-8") as f:
         for idx, row in df.iterrows():
             passage = build_menu_passage(row, max_ing=args.max_ing)
-            # jsonl (간단 버전: 큰따옴표 이스케이프 최소화)
-            passage_escaped = passage.replace("\\", "\\\\").replace('"', '\\"')
-            f.write(f'{{"idx": {idx}, "RCP_SNO": "{row.get("RCP_SNO")}", "CKG_NM": "{row.get("CKG_NM")}", "passage": "{passage_escaped}"}}\n')
+            # one JSON object per line; json.dumps escapes the newlines inside the passage
+            rec = {"idx": int(idx), "RCP_SNO": str(row.get("RCP_SNO")), "CKG_NM": str(row.get("CKG_NM")), "passage": passage}
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     print(f"saved: {args.out}  (rows={len(df)})")
 

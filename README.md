@@ -183,6 +183,7 @@ refactored code no longer produced them. This update reconnects them.
 | `batch_eval.py` stopped at the `#` comment lines in `test_queries.jsonl`. | Comment and blank lines are skipped; per-query `generate_rule` is honoured; the summary again reports average score and failures. |
 | The method note ("조리 방법이 …이라 다른 후보와 스타일이 달라…") was added to every result, even when several results share the method. | Added only when the item's method is unique among the results. |
 | The "(자동 가드레일)" header was guessed from the first result. | The header lists the filters that were actually applied ("(자동 필터)"). |
+| `make_passages.py` built JSON lines by hand and left the passages' line breaks unescaped, so `menu_passages.jsonl` had 19,430 lines for 5,000 records and could not be parsed. | It writes each record with `json.dumps`; the file now has 5,000 lines that all parse, with the same content. Nothing else in the repository reads this file, so retrieval results are unaffected. |
 
 The agreement with the 2026-01-12 run (same recipes, same order, same average score) is the check
 that the restored pipeline behaves like the original one.
